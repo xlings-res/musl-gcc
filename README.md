@@ -7,6 +7,29 @@
 
 ---
 
+<details>
+  <summary>点击查看xlings安装命令</summary>
+
+---
+
+#### Linux
+
+```bash
+curl -fsSL https://d2learn.org/xlings-install.sh | bash
+```
+
+#### Windows - PowerShell
+
+```bash
+Invoke-Expression (Invoke-Webrequest 'https://d2learn.org/xlings-install.ps1.txt' -UseBasicParsing).Content
+```
+
+> 注: xlings具备多版本共存的包管理功能 -> [详情](https://d2learn.org/xlings)
+
+---
+
+</details>
+
 **安装命令**
 
 ```bash
