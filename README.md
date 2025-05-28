@@ -1,4 +1,4 @@
-# xpkg-template | [xlings](https://github.com/d2learn/xlings)
+# GCC | [xlings](https://github.com/d2learn/xlings)
 
 > ...
 
@@ -10,5 +10,9 @@
 **安装命令**
 
 ```bash
-xlings install xpkgname
+xlings install gcc
 ```
+
+**Refs**
+
+- https://gcc.gnu.org
