@@ -33,7 +33,7 @@ Invoke-Expression (Invoke-Webrequest 'https://d2learn.org/xlings-install.ps1.txt
 **安装命令**
 
 ```bash
-xlings install gcc
+xlings install musl-gcc
 ```
 
 **Refs**
