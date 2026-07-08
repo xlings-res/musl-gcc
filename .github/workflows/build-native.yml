@@ -1,0 +1,126 @@
+name: build-native-musl-gcc
+
+# Builds the NATIVE musl-gcc toolchain (build=host=target) for x86_64 and
+# aarch64 via musl-cross-make, strips it, uploads to the release on GitHub
+# AND GitCode (gtc; skipped when GITCODE_TOKEN is absent).
+# Consumed as xim:musl-gcc (XLINGS_RES picks the host-matching asset).
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcc_ver:
+        description: "GCC version"
+        default: "16.1.0"
+      tag:
+        description: "Release tag to upload to"
+        default: "16.1.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential git wget rsync bzip2 xz-utils file python3
+
+      - name: Build native ${{ matrix.arch }}-linux-musl gcc via musl-cross-make
+        env:
+          GCC_VER: ${{ github.event.inputs.gcc_ver }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          printf 'inet4_only = on\ntries = 8\ntimeout = 25\nwaitretry = 5\n' > "$HOME/.wgetrc"
+          git clone --depth 1 https://github.com/richfelker/musl-cross-make /tmp/mcm
+          cd /tmp/mcm
+          # Newer GCC releases need their sha1 injected (mcm only knows
+          # versions it shipped with).
+          if [ ! -f "hashes/gcc-${GCC_VER}.tar.xz.sha1" ]; then
+            wget -q "https://mirrors.kernel.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz" -O "/tmp/gcc-${GCC_VER}.tar.xz" \
+              || wget -q "https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz" -O "/tmp/gcc-${GCC_VER}.tar.xz"
+            mkdir -p sources hashes
+            cp "/tmp/gcc-${GCC_VER}.tar.xz" sources/
+            (cd sources && sha1sum "gcc-${GCC_VER}.tar.xz") > "hashes/gcc-${GCC_VER}.tar.xz.sha1"
+          fi
+          OUT="$PWD/out/musl-gcc-${GCC_VER}-linux-${ARCH}"
+          mkdir -p "$(dirname "$OUT")"
+          cat > config.mak <<CFG
+          GCC_VER = ${GCC_VER}
+          GNU_SITE = https://mirrors.kernel.org/gnu
+          TARGET = ${ARCH}-linux-musl
+          OUTPUT = ${OUT}
+          COMMON_CONFIG += CC="gcc -static --static" CXX="g++ -static --static"
+          CFG
+          make -j"$(nproc)"
+          make -k install OUTPUT="${OUT}" || true
+          test -x "${OUT}/bin/${ARCH}-linux-musl-g++"
+          test -f "${OUT}/${ARCH}-linux-musl/include/c++/${GCC_VER}/bits/std.cc"
+          # ── Strip (unstripped GCC is ~850MB; stripped ~90MB) ──
+          TGT_STRIP="${OUT}/bin/${ARCH}-linux-musl-strip"
+          find "${OUT}" -type f \( -perm -u+x -o -name '*.so*' \) | while read -r f; do
+            case "$(file -b "$f")" in
+              ELF*) "$TGT_STRIP" --strip-unneeded "$f" 2>/dev/null || strip --strip-unneeded "$f" 2>/dev/null || true ;;
+            esac
+          done
+          find "${OUT}" -name '*.a' -exec "$TGT_STRIP" --strip-debug {} + 2>/dev/null || true
+          find "${OUT}" -name '*.o' -exec "$TGT_STRIP" --strip-debug {} + 2>/dev/null || true
+          du -sh "${OUT}"
+          echo "OUT=${OUT}" >> "$GITHUB_ENV"
+
+      - name: Smoke-test (import std, native run)
+        env:
+          GCC_VER: ${{ github.event.inputs.gcc_ver }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          GXX="${OUT}/bin/${ARCH}-linux-musl-g++"
+          t=$(mktemp -d); cd "$t"
+          printf 'import std;\nint main(){ std::unordered_map<std::string,int> m; m["k"]=42; std::println("musl import std ok {}", m["k"]); }\n' > m.cpp
+          STDCC=$(find "${OUT}" -name std.cc -path '*bits*' | head -1)
+          "$GXX" -std=c++23 -fmodules-ts -c "$STDCC" -o std.o
+          "$GXX" -std=c++23 -fmodules-ts m.cpp std.o -static -o hello
+          ./hello
+
+      - name: Package + upload (GitHub + GitCode)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+          GCC_VER: ${{ github.event.inputs.gcc_ver }}
+          TAG: ${{ github.event.inputs.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cd "$(dirname "${OUT}")"
+          NAME="musl-gcc-${GCC_VER}-linux-${ARCH}"
+          tar -czf "${NAME}.tar.gz" "${NAME}"
+          sha256sum "${NAME}.tar.gz" | awk '{print $1}' > "${NAME}.tar.gz.sha256"
+          ls -lh "${NAME}.tar.gz"
+          gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1 \
+            || gh release create "${TAG}" --repo "${{ github.repository }}" --title "${TAG}" --notes "musl-gcc ${GCC_VER} (musl-cross-make, stripped)"
+          gh release upload "${TAG}" --repo "${{ github.repository }}" \
+            "${NAME}.tar.gz" "${NAME}.tar.gz.sha256" --clobber
+          # GitCode mirror (CN path). Skipped without GITCODE_TOKEN.
+          if [ -n "${GITCODE_TOKEN}" ]; then
+            chmod +x "$GITHUB_WORKSPACE/tools/gtc"
+            "$GITHUB_WORKSPACE/tools/gtc" release create "${{ github.repository }}" --tag "${TAG}" --name "${TAG}" 2>/dev/null || true
+            for a in "${NAME}.tar.gz" "${NAME}.tar.gz.sha256"; do
+              for try in 1 2 3 4 5; do
+                timeout 900 "$GITHUB_WORKSPACE/tools/gtc" release upload "${{ github.repository }}" "$a" --tag "${TAG}" >/dev/null 2>&1 || true
+                code=$(curl -fsSL -o /dev/null -w '%{http_code}' -L "https://gitcode.com/${{ github.repository }}/releases/download/${TAG}/$a" 2>/dev/null)
+                [ "$code" = "200" ] && { echo "gitcode OK $a"; break; }
+                echo "gitcode retry($try) $a code=$code"; sleep 5
+              done
+            done
+          else
+            echo "GITCODE_TOKEN absent — gitcode mirror skipped (add the repo/org secret)"
+          fi
